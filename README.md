@@ -33,6 +33,27 @@ You need to declare the following variables in the Cloudflare worker variable se
 | GITHUB_REPOSITORY_BRANCH | main                                        | Branch where the site configuration lies                              |
 | CW_ALLOWED_ORIGINS       | https://example.com,https://www.example.com | Allowed origins that can send a request to the comment-worker         |
 | CW_DEBUG                 | false                                       | Turning debug mode on or off                                          |
+| GITHUB_TOKEN             | ghp_...                                     | Optional: personal access token (e.g. of a bot account) used instead of the GitHub App |
+| TURNSTILE_SECRET_KEY     | 0x4AAA...                                   | Optional: Cloudflare Turnstile secret key; enables Turnstile spam checks |
+| CW_HONEYPOT_FIELD        | hp                                          | Optional: name of the honeypot field (default `hp`)                   |
+| GITHUB_API_URL           | https://api.github.com                      | Optional: GitHub API base URL, mainly for testing against a mock      |
+
+## Staticman compatibility
+
+Entries are written in the same shape staticman produced, so existing staticman data and templates keep working:
+`_id`, then `_parent` (from `options[parent]`), then the fields, then `generatedFields` (only the `date` type is
+supported, with `timestamp`, `timestamp-seconds` or `iso8601` formats). `{@timestamp}` in `filename`/`path` is in
+milliseconds. Optional fields left empty are stored as `''` rather than transformed. Errors are returned as JSON
+`{ "success": false, "errorCode": "..." }`.
+
+## Spam handling
+
+Suspected spam is never dropped: it is always delivered as a pull request (even when `moderation` is off), with the
+title prefixed by `[likely spam]`, a `likely-spam` label and the reasons listed in the PR body. A submission is
+suspect when:
+
+- the honeypot field (`CW_HONEYPOT_FIELD`) is non-empty, or
+- `TURNSTILE_SECRET_KEY` is set and the request's `cf-turnstile-response` token is missing or fails verification.
 
 The `GITHUB_APP_PRIVATE_KEY` needs to be in pkcs8 format, convert the key to pkcs8 format by following the `openssl` command below and input the private key with `\n` as the separators for the line breaks.
 

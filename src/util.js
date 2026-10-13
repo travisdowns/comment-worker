@@ -29,8 +29,8 @@ const convertFormDataToObject = obj => {
   return result;
 };
 
-const handlePlaceholders = (inputValue, fields, options) => {
-  const timestamp = new Date(fields.date).valueOf();
+// `id` and `timestamp` (milliseconds) fill the {@id} and {@timestamp} placeholders
+const handlePlaceholders = (inputValue, fields, options, { id, timestamp }) => {
   const replacedWithFields = inputValue.replace(/\{fields\.(\w+)\}/g, (match, key) => {
     return fields[key] || '';
   });
@@ -38,7 +38,27 @@ const handlePlaceholders = (inputValue, fields, options) => {
     return options[key] || '';
   });
 
-  return replacedValue.replace(/{@timestamp}/g, timestamp).replace(/{@id}/g, fields.id);
+  return replacedValue.replace(/{@timestamp}/g, timestamp).replace(/{@id}/g, id);
+};
+
+// Evaluates staticman-style generatedFields; only the `date` type is supported
+const buildGeneratedFields = (generatedFieldsConfig, now) => {
+  const generated = {};
+
+  for (const [key, config] of Object.entries(generatedFieldsConfig || {})) {
+    if (config?.type !== 'date') continue;
+
+    const format = config?.options?.format || 'iso8601';
+    if (format === 'timestamp') {
+      generated[key] = now.valueOf();
+    } else if (format === 'timestamp-seconds') {
+      generated[key] = Math.floor(now.valueOf() / 1000);
+    } else {
+      generated[key] = now.toISOString();
+    }
+  }
+
+  return generated;
 };
 
 const objectToMarkdownTable = obj => {
@@ -54,4 +74,10 @@ const objectToMarkdownTable = obj => {
   return markdown;
 };
 
-export { convertFormDataToObject, gatherResponse, handlePlaceholders, objectToMarkdownTable };
+export {
+  buildGeneratedFields,
+  convertFormDataToObject,
+  gatherResponse,
+  handlePlaceholders,
+  objectToMarkdownTable
+};

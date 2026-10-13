@@ -13,13 +13,10 @@ workers_dev = true
 # which version of the Workers runtime is used.
 compatibility_date = "2023-08-11"
 
-## example config ##
-#routes = [
-#    { pattern = "comments.zanechua.com", custom_domain = true }
-#]
-#
-#[vars]
-#GITHUB_ORGANIZATION_SLUG = "zanechua"
-#GITHUB_REPOSITORY_SLUG = "website"
-#GITHUB_REPOSITORY_BRANCH = "master"
-#CW_ALLOWED_ORIGINS = "https://zanechua.com"
+# Secrets are set with `wrangler secret put`, never here:
+#   GITHUB_TOKEN (or GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY), TURNSTILE_SECRET_KEY
+[vars]
+GITHUB_ORGANIZATION_SLUG = "travisdowns"
+GITHUB_REPOSITORY_SLUG = "travisdowns.github.io"
+GITHUB_REPOSITORY_BRANCH = "master"
+CW_ALLOWED_ORIGINS = "https://travisdowns.github.io"

@@ -1,16 +1,26 @@
-import { createId as createCuid } from '@paralleldrive/cuid2';
 import { Hono } from 'hono';
 // eslint-disable-next-line
 import { cors } from 'hono/cors';
-import { isUndefined } from 'lodash';
+import { Base64 } from 'js-base64';
+import { pickBy } from 'lodash';
 import yaml from 'yaml';
 import { z } from 'zod';
-import { Base64 } from 'js-base64';
 
 import GitHub from './github';
-import { convertFormDataToObject, handlePlaceholders, objectToMarkdownTable } from './util';
+import { findSpamReasons } from './spam';
+import {
+  buildGeneratedFields,
+  convertFormDataToObject,
+  handlePlaceholders,
+  objectToMarkdownTable
+} from './util';
 import { buildSchemaObject } from './validation';
 import Validator from './validator';
+
+// Name of the form field Turnstile injects its token into
+const turnstileTokenKey = 'cf-turnstile-response';
+
+const spamLabel = 'likely-spam';
 
 // Setting up our application:
 const app = new Hono();
@@ -29,100 +39,156 @@ app.use('/api/*', async (c, next) => {
   return corsMiddleware(c, next);
 });
 
+// Errors are returned as JSON with an errorCode, matching what staticman clients expect
+const errorResponse = (c, errorCode, status) => c.json({ success: false, errorCode }, status);
+
+const createGitHubClient = async env => {
+  const organizationSlug = env.GITHUB_ORGANIZATION_SLUG;
+  const repositorySlug = env.GITHUB_REPOSITORY_SLUG;
+  const apiUrl = env.GITHUB_API_URL || undefined;
+
+  if (env.GITHUB_TOKEN) {
+    return GitHub.fromToken(env.GITHUB_TOKEN, organizationSlug, repositorySlug, apiUrl);
+  }
+
+  // We need to format the private key to handle the line breaks accordingly
+  const formattedPrivateKey = env.GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, '\n');
+  return GitHub.initialize(
+    env.GITHUB_APP_ID,
+    formattedPrivateKey,
+    organizationSlug,
+    repositorySlug,
+    apiUrl
+  );
+};
+
+const parseRequestBody = async req => {
+  const contentTypeHeader = req.header('Content-Type') || '';
+
+  if (contentTypeHeader.startsWith('application/x-www-form-urlencoded')) {
+    return convertFormDataToObject(await req.parseBody());
+  } else if (contentTypeHeader.startsWith('application/json')) {
+    return await req.json();
+  }
+  return undefined;
+};
+
 // The api signature follows hono
 // POST to create the comment
 app.post('/api/handle/form', async c => {
   const { req, env } = c;
-  const currentUrl = req.url;
-  const baseUrl = currentUrl.match(/^(https?:\/\/[^/]+)/)[1];
-
-  const appId = env.GITHUB_APP_ID;
-  // We need to format the private key to handle the line breaks accordingly
-  const formattedPrivateKey = env.GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, '\n');
-  const organizationSlug = env.GITHUB_ORGANIZATION_SLUG;
-  const repositorySlug = env.GITHUB_REPOSITORY_SLUG;
-  const repositoryBranch = env.GITHUB_REPOSITORY_BRANCH;
   const shouldDebug = env.CW_DEBUG === 'true';
+  const honeypotField = env.CW_HONEYPOT_FIELD || 'hp';
 
-  const gh = await GitHub.initialize(appId, formattedPrivateKey, organizationSlug, repositorySlug);
+  const body = await parseRequestBody(req);
+  if (!body) {
+    return errorResponse(c, 'UNSUPPORTED_CONTENT_TYPE', 400);
+  }
+
+  // Handle the fields and options
+  const { [honeypotField]: honeypotValue, ...fieldValues } = body.fields || {};
+  // Options are free form (staticman does not validate them), but only string values are kept
+  const optionValues = pickBy(body.options || {}, value => typeof value === 'string');
+
+  if (shouldDebug) console.log(fieldValues);
+
+  const gh = await createGitHubClient(env);
+  const repositoryBranch = env.GITHUB_REPOSITORY_BRANCH;
 
   const staticmanFile = await gh.getFileFromRepository('staticman.yml', repositoryBranch);
   if (!staticmanFile?.content) {
-    return c.text('Missing staticman.yml', 500);
+    return errorResponse(c, 'MISSING_CONFIG_FILE', 500);
   }
 
   const staticmanConfigJson = yaml.parse(Base64.decode(staticmanFile.content));
   const staticmanCommentsConfig = staticmanConfigJson.comments;
 
-  let body;
-  const contentTypeHeader = req.header('Content-Type');
-
-  if (contentTypeHeader === 'application/x-www-form-urlencoded') {
-    body = convertFormDataToObject(await req.parseBody());
-  } else if (contentTypeHeader === 'application/json') {
-    body = await req.json();
-  } else {
-    return c.text('Unsupported Content-Type', 400);
-  }
-
-  // Handle the fields and options
-  const fieldValues = body.fields || {};
-  const optionValues = body.options || {};
-
-  if (shouldDebug) console.log(fieldValues);
-
   // Handle the default config from the yml file
   const allowedFields = staticmanCommentsConfig?.allowedFields || [];
   const requiredFields = staticmanCommentsConfig?.requiredFields || [];
-  const allowedOptions = staticmanCommentsConfig?.allowedOptions || [];
+  const allowedOptions = staticmanCommentsConfig?.allowedOptions;
   const requiredOptions = staticmanCommentsConfig?.requiredOptions || [];
-  const moderation = staticmanCommentsConfig?.moderation === 'true' || true;
-  const fieldTransforms = staticmanCommentsConfig?.transforms || staticmanCommentsConfig?.fieldTransforms || {};
+  const moderation = String(staticmanCommentsConfig?.moderation) !== 'false';
+  const fieldTransforms =
+    staticmanCommentsConfig?.transforms || staticmanCommentsConfig?.fieldTransforms || {};
   const optionTransforms = staticmanCommentsConfig?.optionTransforms || {};
 
   // Build input fields schema
-  const fieldInputSchema = z.object(buildSchemaObject(allowedFields, requiredFields, fieldTransforms)).strict();
+  const fieldInputSchema = z
+    .object(buildSchemaObject(allowedFields, requiredFields, fieldTransforms))
+    .strict();
 
   // Validate the input fields and escape
-  const {
-    validatedSchema: validatedFields,
-    formattedError,
-    rawError
-  } = await Validator.check(fieldInputSchema, fieldValues);
+  const { validatedSchema: validatedFields, formattedError } = await Validator.inspect(
+    fieldInputSchema,
+    fieldValues
+  );
 
-  if (!isUndefined(rawError) || !isUndefined(formattedError)) {
-    return c.text('Error', 400);
+  if (formattedError) {
+    return errorResponse(c, 'INVALID_FIELDS', 400);
   }
 
-  // Build input options schema
-  const optionInputSchema = z.object(buildSchemaObject(allowedOptions, requiredOptions, optionTransforms)).strict();
+  let validatedOptions = optionValues;
+  if (allowedOptions) {
+    // Build input options schema
+    const optionInputSchema = z
+      .object(buildSchemaObject(allowedOptions, requiredOptions, optionTransforms))
+      .strict();
 
-  // Validate the input options and escape
-  const { validatedSchema: validatedOptions } = await Validator.check(optionInputSchema, optionValues);
+    // Validate the input options and escape
+    const inspection = await Validator.inspect(optionInputSchema, optionValues);
+    if (inspection.formattedError) {
+      return errorResponse(c, 'INVALID_OPTIONS', 400);
+    }
+    validatedOptions = inspection.validatedSchema;
+  }
 
   // Generate unique placeholder properties
-  const commentId = createCuid();
-  const date = new Date().toISOString();
+  const now = new Date();
+  const commentId = crypto.randomUUID();
+  const placeholders = { id: commentId, timestamp: now.valueOf() };
 
+  const generatedFields = buildGeneratedFields(staticmanCommentsConfig?.generatedFields, now);
+  if (!generatedFields.date) {
+    generatedFields.date = now.toISOString();
+  }
+
+  // Same layout as staticman entries: _id and _parent first, then fields, then generated fields
   const fields = {
-    id: commentId,
+    _id: commentId,
+    ...(validatedOptions.parent ? { _parent: validatedOptions.parent } : {}),
     ...validatedFields,
-    date
+    ...generatedFields
   };
+
+  const spamReasons = await findSpamReasons({
+    env,
+    honeypotValue,
+    turnstileToken: body[turnstileTokenKey],
+    remoteIp: req.header('CF-Connecting-IP')
+  });
+  const isSuspect = spamReasons.length > 0;
+
+  if (shouldDebug) console.log({ fields, spamReasons });
 
   // Handle the data to create the comment entry
   const commitMessage = Object.prototype.hasOwnProperty.call(
     staticmanCommentsConfig,
     'commitMessage'
   )
-    ? handlePlaceholders(staticmanCommentsConfig.commitMessage, fields, validatedOptions)
+    ? handlePlaceholders(
+        staticmanCommentsConfig.commitMessage,
+        fields,
+        validatedOptions,
+        placeholders
+      )
     : 'Add comment-worker data';
   const filename = Object.prototype.hasOwnProperty.call(staticmanCommentsConfig, 'filename')
-    ? handlePlaceholders(staticmanCommentsConfig.filename, fields, validatedOptions)
-    : '';
+    ? handlePlaceholders(staticmanCommentsConfig.filename, fields, validatedOptions, placeholders)
+    : commentId;
   const directoryPath = Object.prototype.hasOwnProperty.call(staticmanCommentsConfig, 'path')
-    ? handlePlaceholders(staticmanCommentsConfig.path, fields, validatedOptions)
-    : `_data/results/${new Date(fields.date).valueOf()}`;
+    ? handlePlaceholders(staticmanCommentsConfig.path, fields, validatedOptions, placeholders)
+    : `_data/results/${placeholders.timestamp}`;
 
   const yamlData = yaml.stringify(fields);
   const base64YamlData = Base64.encode(yamlData);
@@ -130,8 +196,11 @@ app.post('/api/handle/form', async c => {
   const defaultBranch = staticmanCommentsConfig?.branch || 'master';
   const branch = `commentworker_${commentId}`;
 
-  if (moderation) {
-    const createBranchResponse = await gh.createBranchOnRepository(branch, defaultBranch);
+  // Suspect entries always go through a pull request, even when moderation is off
+  const usePullRequest = moderation || isSuspect;
+
+  if (usePullRequest) {
+    await gh.createBranchOnRepository(branch, defaultBranch);
   }
 
   const filePath = `${directoryPath}/${filename}.yml`;
@@ -139,31 +208,58 @@ app.post('/api/handle/form', async c => {
     filePath,
     commitMessage,
     base64YamlData,
-    moderation ? branch : defaultBranch
+    usePullRequest ? branch : defaultBranch
   );
 
   if (!createCommentFileResponse?.content) {
-    return c.text('Failed to create comment file. Please check if your file path is valid.', 422);
+    console.error('Failed to create comment file', filePath, createCommentFileResponse);
+    return errorResponse(c, 'FILE_CREATION_FAILED', 422);
   }
 
-  if (moderation) {
+  if (usePullRequest) {
+    const spamSection = isSuspect
+      ? `:warning: **Flagged as likely spam:**\r\n\r\n${spamReasons
+          .map(reason => `- ${reason}`)
+          .join('\r\n')}\r\n\r\n---\r\n\r\n`
+      : '';
     const pullRequestBody = Object.prototype.hasOwnProperty.call(
       staticmanCommentsConfig,
       'pullRequestBody'
     )
-      ? handlePlaceholders(staticmanCommentsConfig.pullRequestBody, fields, validatedOptions)
-      : `Dear human,\r\n\r\nHere\'s a new entry for your approval. :tada:\r\n\r\nMerge the pull request to accept it, or close it to send it away.\r\n\r\n:heart: Your friend [comment-worker](https://github.com/zanechua/comment-worker) :muscle:\r\n\r\n---\r\n\r\n${objectToMarkdownTable(
+      ? handlePlaceholders(
+          staticmanCommentsConfig.pullRequestBody,
+          fields,
+          validatedOptions,
+          placeholders
+        )
+      : `Dear human,\r\n\r\nHere's a new entry for your approval. :tada:\r\n\r\nMerge the pull request to accept it, or close it to send it away.\r\n\r\n:heart: Your friend [comment-worker](https://github.com/zanechua/comment-worker) :muscle:\r\n\r\n---\r\n\r\n${objectToMarkdownTable(
           fields
         )}`;
+    const title = isSuspect ? `[likely spam] ${commitMessage}` : commitMessage;
+
     const pullRequest = await gh.createPullRequestOnRepository(
-      commitMessage,
-      pullRequestBody,
+      title,
+      spamSection + pullRequestBody,
       branch,
       defaultBranch
     );
+
+    if (!pullRequest?.number) {
+      console.error('Failed to create pull request', pullRequest);
+      return errorResponse(c, 'PULL_REQUEST_FAILED', 502);
+    }
+
+    if (isSuspect && !(await gh.addLabelsToIssue(pullRequest.number, [spamLabel]))) {
+      console.error(`Failed to label pull request #${pullRequest.number}`);
+    }
   }
 
-  return c.text('Created', 201);
+  return c.json({ success: true }, 201);
+});
+
+app.onError((error, c) => {
+  console.error(error);
+  return errorResponse(c, 'INTERNAL_ERROR', 500);
 });
 
 // 404 for everything else

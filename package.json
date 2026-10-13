@@ -19,7 +19,6 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@paralleldrive/cuid2": "^2.2.2",
     "hono": "^3.5.8",
     "js-base64": "^3.7.5",
     "lodash": "^4.17.21",
@@ -41,6 +40,6 @@
     "eslint-plugin-unused-imports": "^3.0.0",
     "prettier": "^3.0.3",
     "standard-version": "^9.5.0",
-    "wrangler": "^3.7.0"
+    "wrangler": "^4.0.0"
   }
 }

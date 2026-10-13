@@ -28,7 +28,10 @@ const handleHash = async (algorithm, string) => {
 };
 
 const handleTransformation = async (transformationKey, value) => {
-  if (transformationKey === 'escape') {
+  // An empty optional field stays empty rather than becoming the hash of ''
+  if (value === '') {
+    return value;
+  } else if (transformationKey === 'escape') {
     return escape(value);
   } else {
     return await handleHash(transformationKey, value);
